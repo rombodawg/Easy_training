@@ -53,7 +53,7 @@ if __name__ == "__main__":
 
     # Preprocess the dataset
     def preprocess(example):
-        #Match this to your insturction tempalte, and dataset format
+        #Match this to your instruction template, and dataset format
         formatted_text = f"<|im_start|>system\n{example['instruction']}<|im_end|>\n\n" \
                          f"<|im_start|>user\n{example['input']}<|im_end|>\n\n" \
                          f"<|im_start|>assistant\n{example['output']}<|endoftext|>"
