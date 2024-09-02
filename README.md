@@ -5,7 +5,7 @@ As long as you have some sort of graphics card and train a model that fits in yo
 It's as simple as that.
 
 
-For better Lora training. Use my method
+For better Lora training. Use my method bellow
 
 # Continuous Fine-tuning Without Loss Using Lora and Mergekit
 
