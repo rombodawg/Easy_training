@@ -10,3 +10,40 @@ For better Lora training. Use my method bellow
 # Continuous Fine-tuning Without Loss Using Lora and Mergekit
 
 https://docs.google.com/document/d/1OjbjU5AOz4Ftn9xHQrX3oFQGhQ6RDUuXQipnQ9gn6tU/edit?usp=sharing
+
+
+UPDATE FOR RUNNING "Galore_8bit_Version-2.py"
+
+
+---
+license: apache-2.0
+---
+Prerequisites:
+1. Python:
+https://www.python.org/downloads/
+2. Git:
+https://git-scm.com/downloads
+
+Instructions:
+1. Make sure python and git are installed
+2. Open a command prompt terminal on your local folder
+3. In command prompt run 
+```
+git lfs install
+```
+then
+```
+git clone https://huggingface.co/datasets/Rombo-Org/Easy_Galore_8bit_training_With_Native_Windows_Support
+```
+then
+```
+cd Easy_Galore_8bit_training_With_Native_Windows_Support
+```
+4. Now minimize the command prompt window and open the "Galore_8bit_Version-2.py" file
+5. Edit the paramaters to suite your needs
+6. Open the command prompt window and run
+```
+Python Galore_8bit_Version-2.py
+```
+
+The training will now run completely and save your model in the specified folder location. 
