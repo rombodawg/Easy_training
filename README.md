@@ -47,3 +47,13 @@ Python Galore_8bit_Version-2.py
 ```
 
 The training will now run completely and save your model in the specified folder location. 
+
+
+____________________________________________________________
+
+# LATEST UPDATE
+
+I added a new folder where you can train models with the max reduced Vram using Qlora and Galore. Download the folder, edit the config file, and run this command to execute it
+```
+python QaloreTraining.py --config_file config.txt
+```
