@@ -1,0 +1,7 @@
+torch
+transformers
+datasets
+tqdm
+peft
+bitsandbytes
+galore-torch
