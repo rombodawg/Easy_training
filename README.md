@@ -53,7 +53,15 @@ ____________________________________________________________
 
 # LATEST UPDATE
 
-I added a new folder where you can train models with the max reduced Vram using Qlora and Galore. Download the folder, edit the config file, and run this command to execute it
+I added a new folder where you can train models with the max reduced Vram using Qlora and Galore. 
+
+Download the folder "Galore+Qlora_With_Multi_GPU_Support"
+
+Run
+```
+pip install -r requirements.txt
+```
+edit the config file, and run this command to execute it
 ```
 python QaloreTraining.py --config_file config.txt
 ```
