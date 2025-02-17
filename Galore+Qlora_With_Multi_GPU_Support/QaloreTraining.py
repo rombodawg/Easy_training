@@ -3,21 +3,26 @@ import gc
 import json
 import shutil
 import argparse
+import hashlib
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.cuda.amp import autocast
 
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoConfig,
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig
 )
 from galore_torch import GaLoreAdamW8bit
+from safetensors.torch import load_file
+from accelerate import infer_auto_device_map, dispatch_model
 
 
 def parse_config(config_file: str) -> dict:
@@ -54,6 +59,102 @@ def load_training_state(checkpoint_dir: str) -> dict:
         with open(state_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return None
+
+
+def clear_gpu_memory():
+    """Clear GPU memory and run garbage collection"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def load_model_optimized(model_path, bnb_config, device_map, config):
+    """Load model with optimized settings without caching"""
+    
+    # Determine if flash attention should be used
+    attn_implementation = "flash_attention_2" if config.get("use_flash_attention_2", False) else "eager"
+    
+    # Check if safetensors is available for parallel loading
+    safetensors_path = os.path.join(model_path, "model.safetensors")
+    use_safetensors = os.path.exists(safetensors_path)
+    
+    if use_safetensors:
+        print("Using safetensors for parallel weight initialization")
+        # Load model config
+        model_config = AutoConfig.from_pretrained(model_path)
+        
+        # Create model instance with empty weights
+        if bnb_config is not None:
+            model = AutoModelForCausalLM.from_config(
+                model_config,
+                quantization_config=bnb_config,
+                torch_dtype=torch.float16
+            )
+        else:
+            model = AutoModelForCausalLM.from_config(
+                model_config,
+                torch_dtype=torch.float16
+            )
+        
+        # Initialize model parameters with zeros
+        with torch.no_grad():
+            for param in model.parameters():
+                param.zero_()
+        
+        # Load safetensors weights in parallel
+        weight_map = load_file(safetensors_path, load_tensors_in_parallel=True)
+        for weight_name, weight in weight_map.items():
+            param_names = weight_name.split('.')
+            curr_param = model
+            for name in param_names:
+                if name.isdigit():
+                    curr_param = curr_param[int(name)]
+                else:
+                    try:
+                        curr_param = getattr(curr_param, name)
+                    except AttributeError:
+                        # Skip if parameter doesn't exist in model (could be optimizer states, etc.)
+                        break
+            else:  # Only reaches here if no break occurred
+                with torch.no_grad():
+                    if curr_param.shape == weight.shape:
+                        curr_param.copy_(weight)
+        
+        # Place model on correct device(s)
+        if device_map == "auto":
+            model = dispatch_model(model, device_map=device_map)
+        elif device_map == "cpu":
+            model = model.cpu()
+        else:
+            model = model.to(f"cuda:{list(device_map.values())[0]}" if isinstance(device_map, dict) else "cuda:0")
+    else:
+        # Load model normally with optimized settings
+        print("Using optimized standard loading")
+        with autocast(enabled=True, dtype=torch.float16):
+            if bnb_config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    quantization_config=bnb_config,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    device_map=device_map,
+                    offload_folder="offload_folder",
+                    offload_state_dict=True,
+                    attn_implementation=attn_implementation
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    device_map=device_map,
+                    offload_folder="offload_folder",
+                    offload_state_dict=True,
+                    attn_implementation=attn_implementation
+                )
+    
+    return model
 
 
 def preprocess_function(example: dict, tokenizer, max_seq_length: int, prompt_template: str = None) -> dict:
@@ -102,6 +203,7 @@ def main():
     # Ensure directories exist
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["cache_dir"], exist_ok=True)
+    os.makedirs("offload_folder", exist_ok=True)  # Create offload folder for faster loading
 
     # Setup tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config["model_path"])
@@ -111,14 +213,22 @@ def main():
     num_gpus = config.get("num_gpus", 1)
     if torch.cuda.is_available():
         if num_gpus > 1:
-            # Use Hugging Face device mapping to split model layers across GPUs.
-            device_map = "auto"
+            # Use device mapping to split model layers across GPUs
+            max_memory = config.get("max_memory_per_gpu", None)
+            if max_memory:
+                # Use accelerate for more control over memory allocation
+                device_map = "auto"
+            else:
+                device_map = "auto"
         else:
             device_map = {"": 0}
     else:
         device_map = "cpu"
 
-    # QLoRA integration: load in 4-bit mode if requested.
+    # Clear GPU memory before loading
+    clear_gpu_memory()
+
+    # QLoRA integration: load in 4-bit mode if requested
     if config.get("use_qlora", False):
         # Build BitsAndBytes config for 4-bit quantization
         bnb_config = BitsAndBytesConfig(
@@ -137,22 +247,8 @@ def main():
         else:
             bnb_config = None
 
-    # Load model with quantization config if available
-    if bnb_config is not None:
-        model = AutoModelForCausalLM.from_pretrained(
-            config["model_path"],
-            quantization_config=bnb_config,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map=device_map
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            config["model_path"],
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map=device_map
-        )
+    # Load model with optimized loading strategies (without caching)
+    model = load_model_optimized(config["model_path"], bnb_config, device_map, config)
 
     # ---------------------- QLoRA Integration ----------------------
     if config.get("use_qlora", False):
@@ -177,21 +273,35 @@ def main():
     # Setup prompt template from config (if provided)
     prompt_template = config.get("prompt_template", None)
 
-    # Load and preprocess dataset
+    # Enhanced dataset loading with parallel processing
+    # Use more threads and a larger batch size for loading
+    num_proc = config.get("num_workers_dataset", 12)  # Default to 12 threads for dataset processing
+    batch_size_processing = config.get("batch_size_processing", 32)  # Process 32 examples at once
+    
+    # Load dataset with optimized parameters
     dataset = load_dataset(
         "json",
         data_files=config["dataset_path"],
         split="train",
-        cache_dir=config["cache_dir"]
+        cache_dir=config["cache_dir"],
+        num_proc=num_proc  # Use multiple processes for initial loading
     )
+    
+    # Generate a unique cache file name based on the dataset path to avoid conflicts
+    dataset_hash = hashlib.md5(config["dataset_path"].encode()).hexdigest()
+    cache_file_name = os.path.join(config["cache_dir"], f"processed_dataset_{dataset_hash}.arrow")
+    
+    # Process dataset in parallel with larger batch size
     tokenized_dataset = dataset.map(
         lambda ex: preprocess_function(ex, tokenizer, config["max_seq_length"], prompt_template),
         batched=True,
-        batch_size=4,
-        num_proc=config["num_workers"],
+        batch_size=batch_size_processing,
+        num_proc=num_proc,
         remove_columns=dataset.column_names,
-        cache_file_name=os.path.join(config["cache_dir"], "processed_dataset.arrow")
+        cache_file_name=cache_file_name,
+        load_from_cache_file=True  # Use cache if available but don't require rebuilding it
     )
+    
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_dataloader = DataLoader(
         tokenized_dataset,
@@ -199,7 +309,8 @@ def main():
         shuffle=True,
         num_workers=config["num_workers"],
         pin_memory=True,
-        collate_fn=data_collator
+        collate_fn=data_collator,
+        persistent_workers=True if config["num_workers"] > 0 else False  # Keep workers alive between batches
     )
 
     # Separate parameters for GaLore optimization (targeting "attn" and "mlp" modules)
@@ -308,8 +419,7 @@ def main():
                     shutil.rmtree(os.path.join(config["checkpoint_dir"], oldest_checkpoint))
 
             if step % 100 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+                clear_gpu_memory()
         progress_bar.close()
 
     model_to_save = model.module if hasattr(model, "module") else model
