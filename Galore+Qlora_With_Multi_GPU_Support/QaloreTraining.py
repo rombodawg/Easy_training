@@ -8,7 +8,7 @@ import hashlib
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, SequentialLR, LinearLR
 from torch.cuda.amp import autocast, GradScaler
 
 from tqdm import tqdm
@@ -28,7 +28,7 @@ from accelerate import infer_auto_device_map, dispatch_model
 def parse_config(config_file: str) -> dict:
     """
     Parse the JSON config file and return the configuration dictionary.
-    Automatically replaces backslashes with forward slashes.
+    Automatically replaces backslashes with forward slashes for path consistency.
     """
     with open(config_file, 'r', encoding='utf-8') as f:
         config_str = f.read().replace("\\", "/")
@@ -39,7 +39,6 @@ def save_training_state(checkpoint_dir: str, step: int, epoch: int,
                         optimizer_state: dict, scheduler_state: dict) -> None:
     """
     Save training progress, optimizer state, and scheduler state to a JSON file.
-    Handles GaLore-specific state serialization.
     """
     serializable_optimizer_state = {}
     for key, value in optimizer_state.items():
@@ -48,8 +47,11 @@ def save_training_state(checkpoint_dir: str, step: int, epoch: int,
             for param_id, param_state in value.items():
                 serializable_optimizer_state[key][param_id] = {}
                 for state_key, state_value in param_state.items():
-                    if (hasattr(state_value, '__class__') and 
-                        state_value.__class__.__name__ == 'GaLoreProjector'):
+                    # Skip GaLoreProjector references
+                    if (
+                        hasattr(state_value, '__class__') and
+                        state_value.__class__.__name__ == 'GaLoreProjector'
+                    ):
                         continue
                     if torch.is_tensor(state_value):
                         serializable_optimizer_state[key][param_id][state_key] = state_value.cpu().tolist()
@@ -71,7 +73,7 @@ def save_training_state(checkpoint_dir: str, step: int, epoch: int,
         'optimizer_state': serializable_optimizer_state,
         'scheduler_state': serializable_scheduler_state
     }
-    
+
     with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w', encoding='utf-8') as f:
         json.dump(state, f)
 
@@ -84,115 +86,81 @@ def load_training_state(checkpoint_dir: str, optimizer, scheduler) -> dict:
     state_path = os.path.join(checkpoint_dir, 'training_state.json')
     if not os.path.exists(state_path):
         return None
-        
+
     with open(state_path, 'r', encoding='utf-8') as f:
         state = json.load(f)
-        
+
     optimizer_state = state['optimizer_state']
     for param_id, param_state in optimizer_state['state'].items():
         for state_key, state_value in param_state.items():
             if isinstance(state_value, list):
                 param_state[state_key] = torch.tensor(state_value)
-                
+
     scheduler_state = state['scheduler_state']
     for key, value in scheduler_state.items():
         if isinstance(value, list):
             scheduler_state[key] = torch.tensor(value)
-            
+
     optimizer.load_state_dict(optimizer_state)
     scheduler.load_state_dict(scheduler_state)
-    
+
     return state
 
 
-def clear_gpu_memory():
-    """Clear GPU memory and run garbage collection."""
+def clear_gpu_memory() -> None:
+    """
+    Clear GPU memory and run garbage collection to prevent out-of-memory errors.
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
 
-def load_model_optimized(model_path, bnb_config, device_map, config):
-    """Load model with optimized settings without caching."""
-    attn_implementation = "flash_attention_2" if config.get("use_flash_attention_2", False) else "eager"
-    
-    safetensors_path = os.path.join(model_path, "model.safetensors")
-    use_safetensors = os.path.exists(safetensors_path)
-    
-    if use_safetensors:
-        print("Using safetensors for parallel weight initialization")
-        model_config = AutoConfig.from_pretrained(model_path)
-        if bnb_config is not None:
-            model = AutoModelForCausalLM.from_config(
-                model_config,
-                quantization_config=bnb_config,
-                torch_dtype=torch.float16
-            )
-        else:
-            model = AutoModelForCausalLM.from_config(
-                model_config,
-                torch_dtype=torch.float16
-            )
-        
-        with torch.no_grad():
-            for param in model.parameters():
-                param.zero_()
-        
-        weight_map = load_file(safetensors_path, load_tensors_in_parallel=True)
-        for weight_name, weight in weight_map.items():
-            param_names = weight_name.split('.')
-            curr_param = model
-            for name in param_names:
-                if name.isdigit():
-                    curr_param = curr_param[int(name)]
-                else:
-                    try:
-                        curr_param = getattr(curr_param, name)
-                    except AttributeError:
-                        break
-            else:
-                with torch.no_grad():
-                    if curr_param.shape == weight.shape:
-                        curr_param.copy_(weight)
-        
-        if device_map == "auto":
-            model = dispatch_model(model, device_map=device_map)
-        elif device_map == "cpu":
-            model = model.cpu()
-        else:
-            model = model.to(f"cuda:{list(device_map.values())[0]}" if isinstance(device_map, dict) else "cuda:0")
+def load_model_optimized(model_path: str,
+                         bnb_config: BitsAndBytesConfig,
+                         device_map,
+                         config: dict):
+    """
+    Load model with optimized settings.
+    """
+    attn_implementation = (
+        "flash_attention_2"
+        if config.get("use_flash_attention_2", False)
+        else "eager"
+    )
+
+    print("Using standard from_pretrained to load weights (safetensors if available).")
+
+    if bnb_config is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+            offload_folder="offload_folder",
+            offload_state_dict=True,
+            attn_implementation=attn_implementation
+        )
     else:
-        print("Using optimized standard loading")
-        with autocast(enabled=True, dtype=torch.float16):
-            if bnb_config is not None:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    quantization_config=bnb_config,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map=device_map,
-                    offload_folder="offload_folder",
-                    offload_state_dict=True,
-                    attn_implementation=attn_implementation
-                )
-            else:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map=device_map,
-                    offload_folder="offload_folder",
-                    offload_state_dict=True,
-                    attn_implementation=attn_implementation
-                )
-    
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+            offload_folder="offload_folder",
+            offload_state_dict=True,
+            attn_implementation=attn_implementation
+        )
+
     return model
 
 
-def preprocess_function(example: dict, tokenizer, max_seq_length: int, prompt_template: str = None) -> dict:
+def preprocess_function(example: dict, tokenizer, max_seq_length: int,
+                        prompt_template: str = None) -> dict:
     """
-    Preprocess function to format and tokenize each example from the dataset.
+    Format and tokenize each example from the dataset.
     """
     if prompt_template is None:
         prompt_template = (
@@ -219,7 +187,7 @@ def preprocess_function(example: dict, tokenizer, max_seq_length: int, prompt_te
     return tokenized
 
 
-def main():
+def main() -> None:
     """
     Main training function.
     """
@@ -228,10 +196,12 @@ def main():
     )
     parser.add_argument('--config_file', type=str, required=True,
                         help='Path to the JSON configuration file.')
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                        help='Path to the checkpoint directory to resume training from.')
     args = parser.parse_args()
 
+    # Load config and create directories
     config = parse_config(args.config_file)
-
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["cache_dir"], exist_ok=True)
     os.makedirs("offload_folder", exist_ok=True)
@@ -244,11 +214,8 @@ def main():
         num_gpus = 8
 
     if torch.cuda.is_available():
-        if num_gpus > 1:
-            if config.get("load_in_4bit", False):
-                device_map = "auto"
-            else:
-                device_map = {"": 0}
+        if num_gpus > 1 and config.get("load_in_4bit", False):
+            device_map = "auto"
         else:
             device_map = {"": 0}
     else:
@@ -256,6 +223,7 @@ def main():
 
     clear_gpu_memory()
 
+    # BitsAndBytes configuration
     if config.get("use_qlora", False):
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -272,12 +240,21 @@ def main():
         else:
             bnb_config = None
 
-    model = load_model_optimized(config["model_path"], bnb_config, device_map, config)
+    # Load model
+    model = load_model_optimized(
+        config["model_path"],
+        bnb_config,
+        device_map,
+        config
+    )
 
-    # QLoRA Integration
+    # If using QLoRA, prepare for kbit training and enable LoRA
     if config.get("use_qlora", False):
         from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+
         model = prepare_model_for_kbit_training(model)
+        model.gradient_checkpointing_enable()
+
         lora_config = LoraConfig(
             r=config.get("lora_r", 8),
             lora_alpha=config.get("lora_alpha", 32),
@@ -292,9 +269,9 @@ def main():
 
     prompt_template = config.get("prompt_template", None)
 
+    # Prepare dataset
     num_proc = config.get("num_workers_dataset", 12)
     batch_size_processing = config.get("batch_size_processing", 32)
-    
     dataset = load_dataset(
         "json",
         data_files=config["dataset_path"],
@@ -302,12 +279,16 @@ def main():
         cache_dir=config["cache_dir"],
         num_proc=num_proc
     )
-    
+
     dataset_hash = hashlib.md5(config["dataset_path"].encode()).hexdigest()
-    cache_file_name = os.path.join(config["cache_dir"], f"processed_dataset_{dataset_hash}.arrow")
-    
+    cache_file_name = os.path.join(
+        config["cache_dir"], f"processed_dataset_{dataset_hash}.arrow"
+    )
+
     tokenized_dataset = dataset.map(
-        lambda ex: preprocess_function(ex, tokenizer, config["max_seq_length"], prompt_template),
+        lambda ex: preprocess_function(
+            ex, tokenizer, config["max_seq_length"], prompt_template
+        ),
         batched=True,
         batch_size=batch_size_processing,
         num_proc=num_proc,
@@ -315,8 +296,10 @@ def main():
         cache_file_name=cache_file_name,
         load_from_cache_file=True
     )
-    
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=False
+    )
     train_dataloader = DataLoader(
         tokenized_dataset,
         batch_size=config["batch_size"],
@@ -327,7 +310,7 @@ def main():
         persistent_workers=True if config["num_workers"] > 0 else False
     )
 
-    # Separate parameters for GaLore optimization
+    # Separate parameters for GaLore
     target_modules_list = ["attn", "mlp"]
     galore_params = []
     model_to_iterate = model.module if hasattr(model, "module") else model
@@ -354,30 +337,55 @@ def main():
         }
     ]
 
-    optimizer = GaLoreAdamW8bit(param_groups, lr=config["learning_rate"])
-    total_training_steps = len(train_dataloader)
-    first_cycle_steps = int(total_training_steps * config["first_cycle_fraction"])
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=first_cycle_steps,
-        T_mult=config["t_mult"],
-        eta_min=config["eta_min"]
+    optimizer = GaLoreAdamW8bit(
+        param_groups, lr=config["learning_rate"]
     )
 
+    total_training_steps = len(train_dataloader)
+    first_cycle_steps = int(total_training_steps * config["first_cycle_fraction"])
+    
+    # Learning rate warmup (if specified in config)
+    warmup_steps = config.get("warmup_steps", 0)
+    if warmup_steps > 0:
+        # Use a very small start_factor (e.g., 1e-8) instead of 0.0
+        warmup_scheduler = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=first_cycle_steps,
+            T_mult=config["t_mult"],
+            eta_min=config["eta_min"]
+        )
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_steps])
+    else:
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=first_cycle_steps,
+            T_mult=config["t_mult"],
+            eta_min=config["eta_min"]
+        )
+
+    # Set starting step/epoch based on whether we're resuming from a checkpoint.
     start_step = 0
     start_epoch = 0
+    if args.resume_checkpoint is not None:
+        state = load_training_state(args.resume_checkpoint, optimizer, scheduler)
+        if state is not None:
+            start_step = state['step']
+            start_epoch = state['epoch']
+            print(f"Resuming training from epoch {start_epoch}, step {start_step}")
+
     model.train()
     total_steps = len(train_dataloader)
     prev_avg_loss = 0.0
     accumulation_steps = config["accumulation_steps"]
 
-    # Initialize GradScaler for mixed precision training
     scaler = GradScaler()
 
     for epoch in range(start_epoch, config["num_epochs"]):
         running_loss = 0.0
         optimizer.zero_grad()
         progress_bar = tqdm(enumerate(train_dataloader), total=total_steps, initial=start_step)
+
         for step, batch in progress_bar:
             if step < start_step:
                 continue
@@ -391,34 +399,37 @@ def main():
             if 'attention_mask' not in inputs:
                 inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
 
-            # Use autocast for the forward pass
             with autocast():
                 outputs = model(**inputs)
                 loss = outputs.loss / accumulation_steps
 
-            # Scale the loss and backpropagate
             scaler.scale(loss).backward()
             running_loss += loss.item()
 
             if (step + 1) % accumulation_steps == 0:
-                # Convert FP16 gradients to FP32 before unscale to avoid error
                 for group in optimizer.param_groups:
                     for p in group['params']:
                         if p.grad is not None and p.grad.dtype == torch.float16:
                             p.grad.data = p.grad.data.float()
-                            
+
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config["max_grad_norm"])
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=config["max_grad_norm"]
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
+
                 current_lr = scheduler.get_last_lr()[0]
                 current_loss = running_loss
                 avg_loss = current_loss if step == 0 else (current_loss * 0.1 + prev_avg_loss * 0.9)
                 prev_avg_loss = avg_loss
+
+                # Compute epoch progress as: current epoch index + (current step/total steps)
+                epoch_progress = epoch + (step / total_steps)
                 progress_bar.set_postfix({
-                    'epoch': epoch + 1,
+                    'epoch': f'{epoch_progress:.2f}',
                     'loss': f'{current_loss:.5f}',
                     'avg_loss': f'{avg_loss:.5f}',
                     'lr': f'{current_lr:.2e}',
@@ -427,9 +438,12 @@ def main():
                 running_loss = 0.0
 
             if step > 0 and step % config["save_interval"] == 0:
-                checkpoint_path = os.path.join(config['checkpoint_dir'], f"checkpoint-{step}")
+                checkpoint_path = os.path.join(
+                    config['checkpoint_dir'], f"checkpoint-{step}"
+                )
                 model_to_save = model.module if hasattr(model, "module") else model
                 model_to_save.save_pretrained(checkpoint_path)
+
                 save_training_state(
                     checkpoint_path,
                     step,
@@ -437,6 +451,8 @@ def main():
                     optimizer.state_dict(),
                     scheduler.state_dict()
                 )
+
+                # Remove older checkpoints if necessary
                 checkpoints = sorted([
                     d for d in os.listdir(config["checkpoint_dir"])
                     if d.startswith('checkpoint-')
@@ -447,6 +463,7 @@ def main():
 
             if step % 100 == 0:
                 clear_gpu_memory()
+
         progress_bar.close()
 
     model_to_save = model.module if hasattr(model, "module") else model
