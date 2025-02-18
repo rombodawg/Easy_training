@@ -1,6 +1,12 @@
+SUPPORT ME ON PATREON
+
+- https://www.patreon.com/c/Rombodawg
+
+_____________________________________________________________________________________________
 # A single runnable file for LLM training. Everything you need can be executed from the 1 file. 
 
 Note: This code supports full-tuning if "use_qlora:" flag is set to "false"
+_______________________________________________________________________________________________
 
 For better Lora training. Use my method bellow
 
