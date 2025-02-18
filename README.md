@@ -1,6 +1,6 @@
 # A single runnable file for LLM training. Everything you need can be executed from the 1 file. 
 
-Note: This code supports full-tuning if "use_qlora:" is set to "false"
+Note: This code supports full-tuning if "use_qlora:" flag is set to "false"
 
 For better Lora training. Use my method bellow
 
