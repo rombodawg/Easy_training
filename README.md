@@ -41,6 +41,10 @@ python QaloreTraining.py --config_file config.txt
   Folder where the final fine-tuned model is saved after training.  
   Use: `"final_output_path": "./models/final_model"`
 
+- **device_map**:
+  Specifies how the model's layers are distributed across devices (GPUs or CPUs).
+  Use: `"device_map": "auto"`
+
 - **num_epochs**:  
   Number of full passes through your entire dataset during training.  
   Use: `"num_epochs": 1`
