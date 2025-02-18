@@ -7,12 +7,9 @@ import hashlib
 
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.cuda.amp import autocast, GradScaler
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 
 from tqdm import tqdm
 from datasets import load_dataset
@@ -25,32 +22,25 @@ from transformers import (
 )
 from galore_torch import GaLoreAdamW8bit
 from safetensors.torch import load_file
-from accelerate import dispatch_model
-
-
-def setup_distributed(rank, world_size):
-    """Initialize distributed training environment"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-
-def cleanup_distributed():
-    """Clean up distributed training environment"""
-    dist.destroy_process_group()
+from accelerate import infer_auto_device_map, dispatch_model
 
 
 def parse_config(config_file: str) -> dict:
-    """Parse the JSON config file and return the configuration dictionary."""
+    """
+    Parse the JSON config file and return the configuration dictionary.
+    Automatically replaces backslashes with forward slashes.
+    """
     with open(config_file, 'r', encoding='utf-8') as f:
         config_str = f.read().replace("\\", "/")
         return json.loads(config_str)
 
 
 def save_training_state(checkpoint_dir: str, step: int, epoch: int,
-                       optimizer_state: dict, scheduler_state: dict, scaler_state: dict) -> None:
-    """Save training progress and states."""
+                        optimizer_state: dict, scheduler_state: dict) -> None:
+    """
+    Save training progress, optimizer state, and scheduler state to a JSON file.
+    Handles GaLore-specific state serialization.
+    """
     serializable_optimizer_state = {}
     for key, value in optimizer_state.items():
         if key == 'state':
@@ -79,16 +69,18 @@ def save_training_state(checkpoint_dir: str, step: int, epoch: int,
         'step': step,
         'epoch': epoch,
         'optimizer_state': serializable_optimizer_state,
-        'scheduler_state': serializable_scheduler_state,
-        'scaler_state': scaler_state
+        'scheduler_state': serializable_scheduler_state
     }
     
     with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w', encoding='utf-8') as f:
         json.dump(state, f)
 
 
-def load_training_state(checkpoint_dir: str, optimizer, scheduler, scaler) -> dict:
-    """Load training progress and states."""
+def load_training_state(checkpoint_dir: str, optimizer, scheduler) -> dict:
+    """
+    Load training progress, optimizer state, and scheduler state from a JSON file.
+    Reconstructs the state for both optimizer and scheduler.
+    """
     state_path = os.path.join(checkpoint_dir, 'training_state.json')
     if not os.path.exists(state_path):
         return None
@@ -109,29 +101,28 @@ def load_training_state(checkpoint_dir: str, optimizer, scheduler, scaler) -> di
             
     optimizer.load_state_dict(optimizer_state)
     scheduler.load_state_dict(scheduler_state)
-    scaler.load_state_dict(state['scaler_state'])
     
     return state
 
 
 def clear_gpu_memory():
-    """Clear GPU memory and run garbage collection"""
+    """Clear GPU memory and run garbage collection."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
 
-def load_model_optimized(model_path, bnb_config, rank, config):
-    """Load model with optimized settings"""
+def load_model_optimized(model_path, bnb_config, device_map, config):
+    """Load model with optimized settings without caching."""
     attn_implementation = "flash_attention_2" if config.get("use_flash_attention_2", False) else "eager"
+    
     safetensors_path = os.path.join(model_path, "model.safetensors")
     use_safetensors = os.path.exists(safetensors_path)
     
     if use_safetensors:
-        print(f"[Rank {rank}] Using safetensors for parallel weight initialization")
+        print("Using safetensors for parallel weight initialization")
         model_config = AutoConfig.from_pretrained(model_path)
-        
         if bnb_config is not None:
             model = AutoModelForCausalLM.from_config(
                 model_config,
@@ -165,9 +156,14 @@ def load_model_optimized(model_path, bnb_config, rank, config):
                     if curr_param.shape == weight.shape:
                         curr_param.copy_(weight)
         
-        model = model.to(f"cuda:{rank}")
+        if device_map == "auto":
+            model = dispatch_model(model, device_map=device_map)
+        elif device_map == "cpu":
+            model = model.cpu()
+        else:
+            model = model.to(f"cuda:{list(device_map.values())[0]}" if isinstance(device_map, dict) else "cuda:0")
     else:
-        print(f"[Rank {rank}] Using optimized standard loading")
+        print("Using optimized standard loading")
         with autocast(enabled=True, dtype=torch.float16):
             if bnb_config is not None:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -175,7 +171,7 @@ def load_model_optimized(model_path, bnb_config, rank, config):
                     quantization_config=bnb_config,
                     torch_dtype=torch.float16,
                     low_cpu_mem_usage=True,
-                    device_map={"": rank},
+                    device_map=device_map,
                     offload_folder="offload_folder",
                     offload_state_dict=True,
                     attn_implementation=attn_implementation
@@ -185,7 +181,7 @@ def load_model_optimized(model_path, bnb_config, rank, config):
                     model_path,
                     torch_dtype=torch.float16,
                     low_cpu_mem_usage=True,
-                    device_map={"": rank},
+                    device_map=device_map,
                     offload_folder="offload_folder",
                     offload_state_dict=True,
                     attn_implementation=attn_implementation
@@ -195,7 +191,9 @@ def load_model_optimized(model_path, bnb_config, rank, config):
 
 
 def preprocess_function(example: dict, tokenizer, max_seq_length: int, prompt_template: str = None) -> dict:
-    """Preprocess function to format and tokenize examples."""
+    """
+    Preprocess function to format and tokenize each example from the dataset.
+    """
     if prompt_template is None:
         prompt_template = (
             "<|im_start|>system\n\n{instruction}<|im_end|>\n"
@@ -221,22 +219,43 @@ def preprocess_function(example: dict, tokenizer, max_seq_length: int, prompt_te
     return tokenized
 
 
-def train(rank, world_size, config):
-    """Main training function for each process."""
-    setup_distributed(rank, world_size)
-    
-    # Ensure directories exist
+def main():
+    """
+    Main training function.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train a model with multi-GPU support and 4-bit QLoRA."
+    )
+    parser.add_argument('--config_file', type=str, required=True,
+                        help='Path to the JSON configuration file.')
+    args = parser.parse_args()
+
+    config = parse_config(args.config_file)
+
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["cache_dir"], exist_ok=True)
     os.makedirs("offload_folder", exist_ok=True)
 
-    # Setup tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config["model_path"])
     tokenizer.pad_token = tokenizer.eos_token
 
+    num_gpus = config.get("num_gpus", 1)
+    if num_gpus > 8:
+        num_gpus = 8
+
+    if torch.cuda.is_available():
+        if num_gpus > 1:
+            if config.get("load_in_4bit", False):
+                device_map = "auto"
+            else:
+                device_map = {"": 0}
+        else:
+            device_map = {"": 0}
+    else:
+        device_map = "cpu"
+
     clear_gpu_memory()
 
-    # QLoRA setup
     if config.get("use_qlora", False):
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -253,8 +272,7 @@ def train(rank, world_size, config):
         else:
             bnb_config = None
 
-    # Load model
-    model = load_model_optimized(config["model_path"], bnb_config, rank, config)
+    model = load_model_optimized(config["model_path"], bnb_config, device_map, config)
 
     # QLoRA Integration
     if config.get("use_qlora", False):
@@ -269,16 +287,11 @@ def train(rank, world_size, config):
         )
         model = get_peft_model(model, lora_config)
 
-    # Disable cache to fix gradient checkpointing error
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-    elif hasattr(model, "base_model") and hasattr(model.base_model, "config"):
-        model.base_model.config.use_cache = False
+    if num_gpus > 1 and device_map != "auto":
+        model = torch.nn.DataParallel(model, device_ids=list(range(num_gpus)))
 
-    # Wrap model with DDP
-    model = DDP(model, device_ids=[rank], output_device=rank)
+    prompt_template = config.get("prompt_template", None)
 
-    # Dataset preparation
     num_proc = config.get("num_workers_dataset", 12)
     batch_size_processing = config.get("batch_size_processing", 32)
     
@@ -294,7 +307,7 @@ def train(rank, world_size, config):
     cache_file_name = os.path.join(config["cache_dir"], f"processed_dataset_{dataset_hash}.arrow")
     
     tokenized_dataset = dataset.map(
-        lambda ex: preprocess_function(ex, tokenizer, config["max_seq_length"], config.get("prompt_template")),
+        lambda ex: preprocess_function(ex, tokenizer, config["max_seq_length"], prompt_template),
         batched=True,
         batch_size=batch_size_processing,
         num_proc=num_proc,
@@ -302,30 +315,22 @@ def train(rank, world_size, config):
         cache_file_name=cache_file_name,
         load_from_cache_file=True
     )
-
-    # Setup distributed sampler and dataloader
-    sampler = DistributedSampler(
-        tokenized_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True
-    )
     
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_dataloader = DataLoader(
         tokenized_dataset,
-        batch_size=config["batch_size"] // world_size,  # Adjust batch size per GPU
-        sampler=sampler,
+        batch_size=config["batch_size"],
+        shuffle=True,
         num_workers=config["num_workers"],
         pin_memory=True,
         collate_fn=data_collator,
         persistent_workers=True if config["num_workers"] > 0 else False
     )
 
-    # Optimizer setup
+    # Separate parameters for GaLore optimization
     target_modules_list = ["attn", "mlp"]
     galore_params = []
-    model_to_iterate = model.module
+    model_to_iterate = model.module if hasattr(model, "module") else model
 
     for module_name, module in model_to_iterate.named_modules():
         if isinstance(module, nn.Linear) and any(key in module_name for key in target_modules_list):
@@ -349,7 +354,6 @@ def train(rank, world_size, config):
         }
     ]
 
-    # Initialize optimizer, scheduler, and gradient scaler
     optimizer = GaLoreAdamW8bit(param_groups, lr=config["learning_rate"])
     total_training_steps = len(train_dataloader)
     first_cycle_steps = int(total_training_steps * config["first_cycle_fraction"])
@@ -359,7 +363,6 @@ def train(rank, world_size, config):
         T_mult=config["t_mult"],
         eta_min=config["eta_min"]
     )
-    scaler = GradScaler()
 
     start_step = 0
     start_epoch = 0
@@ -368,79 +371,72 @@ def train(rank, world_size, config):
     prev_avg_loss = 0.0
     accumulation_steps = config["accumulation_steps"]
 
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+
     for epoch in range(start_epoch, config["num_epochs"]):
-        sampler.set_epoch(epoch)  # Set epoch for distributed sampler
         running_loss = 0.0
         optimizer.zero_grad()
-        
-        if rank == 0:  # Only create progress bar on main process
-            progress_bar = tqdm(enumerate(train_dataloader), total=total_steps, initial=start_step)
-        else:
-            progress_bar = enumerate(train_dataloader)
-            
+        progress_bar = tqdm(enumerate(train_dataloader), total=total_steps, initial=start_step)
         for step, batch in progress_bar:
             if step < start_step:
                 continue
 
-            with autocast(enabled=True):
-                inputs = {
-                    k: v.to(rank, non_blocking=True)
-                    if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-                if 'attention_mask' not in inputs:
-                    inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
+            primary_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            inputs = {
+                k: v.view(-1, v.size(-1)).to(primary_device, non_blocking=True)
+                if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            if 'attention_mask' not in inputs:
+                inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
+
+            # Use autocast for the forward pass
+            with autocast():
                 outputs = model(**inputs)
                 loss = outputs.loss / accumulation_steps
 
-            # Scale loss and backward pass
+            # Scale the loss and backpropagate
             scaler.scale(loss).backward()
             running_loss += loss.item()
 
             if (step + 1) % accumulation_steps == 0:
-                # Unscale gradients for gradient clipping
+                # Convert FP16 gradients to FP32 before unscale to avoid error
+                for group in optimizer.param_groups:
+                    for p in group['params']:
+                        if p.grad is not None and p.grad.dtype == torch.float16:
+                            p.grad.data = p.grad.data.float()
+                            
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config["max_grad_norm"])
-                
-                # Optimizer step with scaling
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
                 optimizer.zero_grad()
-
-                # Gather loss from all processes
-                loss_tensor = torch.tensor(running_loss, device=f'cuda:{rank}')
-                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-                running_loss = loss_tensor.item() / world_size
-
-                if rank == 0:  # Only update progress bar on main process
-                    current_lr = scheduler.get_last_lr()[0]
-                    current_loss = running_loss
-                    avg_loss = current_loss if step == 0 else (current_loss * 0.1 + prev_avg_loss * 0.9)
-                    prev_avg_loss = avg_loss
-                    progress_bar.set_postfix({
-                        'epoch': epoch + 1,
-                        'loss': f'{current_loss:.4f}',
-                        'avg_loss': f'{avg_loss:.4f}',
-                        'lr': f'{current_lr:.2e}',
-                        'step': f'{step}/{total_steps}'
-                    })
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0]
+                current_loss = running_loss
+                avg_loss = current_loss if step == 0 else (current_loss * 0.1 + prev_avg_loss * 0.9)
+                prev_avg_loss = avg_loss
+                progress_bar.set_postfix({
+                    'epoch': epoch + 1,
+                    'loss': f'{current_loss:.5f}',
+                    'avg_loss': f'{avg_loss:.5f}',
+                    'lr': f'{current_lr:.2e}',
+                    'step': f'{step}/{total_steps}'
+                })
                 running_loss = 0.0
 
-            # Save checkpoints only on rank 0
-            if rank == 0 and step > 0 and step % config["save_interval"] == 0:
+            if step > 0 and step % config["save_interval"] == 0:
                 checkpoint_path = os.path.join(config['checkpoint_dir'], f"checkpoint-{step}")
-                model_to_save = model.module
+                model_to_save = model.module if hasattr(model, "module") else model
                 model_to_save.save_pretrained(checkpoint_path)
                 save_training_state(
                     checkpoint_path,
                     step,
                     epoch,
                     optimizer.state_dict(),
-                    scheduler.state_dict(),
-                    scaler.state_dict()
+                    scheduler.state_dict()
                 )
-                # Cleanup old checkpoints
                 checkpoints = sorted([
                     d for d in os.listdir(config["checkpoint_dir"])
                     if d.startswith('checkpoint-')
@@ -451,48 +447,17 @@ def train(rank, world_size, config):
 
             if step % 100 == 0:
                 clear_gpu_memory()
+        progress_bar.close()
 
-        if rank == 0:
-            progress_bar.close()
-
-    # Save final model only on rank 0
-    if rank == 0:
-        model_to_save = model.module
-        model_to_save.save_pretrained(config["final_output_path"])
-        tokenizer.save_pretrained(config["final_output_path"])
-        save_training_state(
-            config["final_output_path"],
-            total_training_steps,
-            epoch,
-            optimizer.state_dict(),
-            scheduler.state_dict(),
-            scaler.state_dict()
-        )
-
-    cleanup_distributed()
-
-
-def main():
-    """Main function to setup distributed training"""
-    parser = argparse.ArgumentParser(
-        description="Train a model with DDP and GaLore optimization."
-    )
-    parser.add_argument('--config_file', type=str, required=True,
-                      help='Path to the JSON configuration file.')
-    args = parser.parse_args()
-
-    # Load configuration
-    config = parse_config(args.config_file)
-    
-    # Get world size from config
-    world_size = config.get("num_gpus", 1)
-    
-    # Launch distributed processes
-    torch.multiprocessing.spawn(
-        train,
-        args=(world_size, config),
-        nprocs=world_size,
-        join=True
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(config["final_output_path"])
+    tokenizer.save_pretrained(config["final_output_path"])
+    save_training_state(
+        config["final_output_path"],
+        total_training_steps,
+        epoch,
+        optimizer.state_dict(),
+        scheduler.state_dict()
     )
 
 
