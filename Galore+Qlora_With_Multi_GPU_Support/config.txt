@@ -16,6 +16,7 @@
   "first_cycle_fraction": 0.1,
   "t_mult": 2,
   "rank": 64,
+  "warmup_steps": 200,
   "update_proj_gap": 200,
   "scale": 0.25,
   "proj_type": "std",
