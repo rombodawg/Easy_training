@@ -106,7 +106,7 @@ python QaloreTraining.py --config_file config.txt
   *Example:* `"max_seq_length": 2048`
 
 - **use_qlora**:  
-  If set to `true`, uses LoRA adapters (only a subset of model parameters is trained).  
+  If set to `true`, uses LoRA adapters (only a subset of model parameters is trained). If set to `false` this will essentailly be full-tuning.
   *Example:* `"use_qlora": true`
 
 - **load_in_4bit**:  
