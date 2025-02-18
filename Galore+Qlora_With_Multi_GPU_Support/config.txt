@@ -17,6 +17,7 @@
   "t_mult": 2,
   "rank": 64,
   "update_proj_gap": 200,
+  "device_map": "auto",
   "scale": 0.25,
   "proj_type": "std",
   "max_seq_length": 2048,
