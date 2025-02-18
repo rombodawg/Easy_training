@@ -36,29 +36,80 @@ def parse_config(config_file: str) -> dict:
 
 
 def save_training_state(checkpoint_dir: str, step: int, epoch: int,
-                          optimizer_state: dict, scheduler_state: dict) -> None:
+                        optimizer_state: dict, scheduler_state: dict) -> None:
     """
     Save training progress, optimizer state, and scheduler state to a JSON file.
+    Handles GaLore-specific state serialization.
     """
+    # Create a serializable copy of optimizer state
+    serializable_optimizer_state = {}
+    for key, value in optimizer_state.items():
+        if key == 'state':
+            serializable_optimizer_state[key] = {}
+            for param_id, param_state in value.items():
+                serializable_optimizer_state[key][param_id] = {}
+                for state_key, state_value in param_state.items():
+                    # Skip GaLoreProjector objects which cannot be serialized
+                    if (hasattr(state_value, '__class__') and 
+                        state_value.__class__.__name__ == 'GaLoreProjector'):
+                        continue
+                    # Convert tensors to lists
+                    if torch.is_tensor(state_value):
+                        serializable_optimizer_state[key][param_id][state_key] = state_value.cpu().tolist()
+                    else:
+                        serializable_optimizer_state[key][param_id][state_key] = state_value
+        else:
+            serializable_optimizer_state[key] = value
+
+    # Create serializable scheduler state
+    serializable_scheduler_state = {}
+    for key, value in scheduler_state.items():
+        if torch.is_tensor(value):
+            serializable_scheduler_state[key] = value.cpu().tolist()
+        else:
+            serializable_scheduler_state[key] = value
+
     state = {
         'step': step,
         'epoch': epoch,
-        'optimizer_state': optimizer_state,
-        'scheduler_state': scheduler_state
+        'optimizer_state': serializable_optimizer_state,
+        'scheduler_state': serializable_scheduler_state
     }
+    
     with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w', encoding='utf-8') as f:
         json.dump(state, f)
 
 
-def load_training_state(checkpoint_dir: str) -> dict:
+def load_training_state(checkpoint_dir: str, optimizer, scheduler) -> dict:
     """
     Load training progress, optimizer state, and scheduler state from a JSON file.
+    Reconstructs the state for both optimizer and scheduler.
     """
     state_path = os.path.join(checkpoint_dir, 'training_state.json')
-    if os.path.exists(state_path):
-        with open(state_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(state_path):
+        return None
+        
+    with open(state_path, 'r', encoding='utf-8') as f:
+        state = json.load(f)
+        
+    # Reconstruct optimizer state
+    optimizer_state = state['optimizer_state']
+    for param_id, param_state in optimizer_state['state'].items():
+        for state_key, state_value in param_state.items():
+            if isinstance(state_value, list):
+                param_state[state_key] = torch.tensor(state_value)
+                
+    # Reconstruct scheduler state
+    scheduler_state = state['scheduler_state']
+    for key, value in scheduler_state.items():
+        if isinstance(value, list):
+            scheduler_state[key] = torch.tensor(value)
+            
+    # Load states back into optimizer and scheduler
+    optimizer.load_state_dict(optimizer_state)
+    scheduler.load_state_dict(scheduler_state)
+    
+    return state
 
 
 def clear_gpu_memory():
@@ -274,7 +325,6 @@ def main():
     prompt_template = config.get("prompt_template", None)
 
     # Enhanced dataset loading with parallel processing
-    # Use more threads and a larger batch size for loading
     num_proc = config.get("num_workers_dataset", 12)  # Default to 12 threads for dataset processing
     batch_size_processing = config.get("batch_size_processing", 32)  # Process 32 examples at once
     
