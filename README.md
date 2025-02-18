@@ -19,136 +19,127 @@ edit the config file, and run this command to execute it
 python QaloreTraining.py --config_file config.txt
 ```
 
-# Explanation of Config Flags:
+### Explanation of Config Flags
 
 - **model_path**:  
-  Folder (or Hugging Face ID) of the pre-trained model you start with.  
-  Use: `"model_path": "./models/your_model"`
+  Folder (or Hugging Face model ID) for the pre-trained model you start with.  
+  *Example:* `"model_path": "./model"`
 
 - **checkpoint_dir**:  
-  Folder where training checkpoints (temporary model snapshots) are saved.  
-  Use: `"checkpoint_dir": "./models/checkpoints"`
+  Directory where training checkpoints (temporary model snapshots) are saved.  
+  *Example:* `"checkpoint_dir": "./checkpoint"`
 
 - **cache_dir**:  
-  Directory for storing cached data (helps load data faster).  
-  Use: `"cache_dir": "./models/cache"`
+  Directory for storing cached data (speeds up dataset loading).  
+  *Example:* `"cache_dir": "./cache"`
 
 - **dataset_path**:  
-  Path to the JSON file that contains your training examples.  
-  Use: `"dataset_path": "./models/dataset.json"`
+  Path to the JSON file containing your training examples.  
+  *Example:* `"dataset_path": "./dataset.json"`
 
 - **final_output_path**:  
-  Folder where the final fine-tuned model is saved after training.  
-  Use: `"final_output_path": "./models/final_model"`
-
-- **device_map**:
-  Specifies how the model's layers are distributed across devices (GPUs or CPUs).
-  Use: `"device_map": "auto"`
+  Directory where the final fine-tuned model and tokenizer will be saved.  
+  *Example:* `"final_output_path": "./output"`
 
 - **num_epochs**:  
-  Number of full passes through your entire dataset during training.  
-  Use: `"num_epochs": 1`
+  Number of full passes through your dataset during training.  
+  *Example:* `"num_epochs": 1`
 
 - **save_interval**:  
   Number of training steps between each checkpoint save.  
-  Use: `"save_interval": 900`
+  *Example:* `"save_interval": 100000000000000000`
 
 - **keep_last_checkpoints**:  
-  Maximum number of recent checkpoints to keep; older ones are removed.  
-  Use: `"keep_last_checkpoints": 3`
+  Maximum number of most recent checkpoints to retain (older ones are removed).  
+  *Example:* `"keep_last_checkpoints": 3`
 
 - **batch_size**:  
-  Number of examples processed in one forward/backward pass.  
-  Use: `"batch_size": 3`
+  Number of examples processed per forward/backward pass.  
+  *Example:* `"batch_size": 4`
 
 - **accumulation_steps**:  
-  Number of batches to accumulate gradients before updating weights (simulates a larger batch).  
-  Use: `"accumulation_steps": 20`
+  Number of batches to accumulate before performing an optimizer update (simulates a larger batch size).  
+  *Example:* `"accumulation_steps": 20`
 
 - **num_workers**:  
-  Number of CPU threads used for loading the data.  
-  Use: `"num_workers": 12`
+  Number of CPU threads to use for loading data in the DataLoader.  
+  *Example:* `"num_workers": 3`
 
 - **max_grad_norm**:  
-  Maximum allowed value for gradients (to prevent exploding gradients).  
-  Use: `"max_grad_norm": 1.0`
+  Maximum gradient norm for gradient clipping (prevents exploding gradients).  
+  *Example:* `"max_grad_norm": 1.0`
 
 - **learning_rate**:  
-  Speed at which the model learns; a smaller value means slower updates.  
-  Use: `"learning_rate": 0.0003`
+  The learning rate for the optimizer; determines how fast the model learns.  
+  *Example:* `"learning_rate": 0.0003`
 
 - **eta_min**:  
-  The lowest learning rate the scheduler will use during training.  
-  Use: `"eta_min": 1e-6`
+  The minimum learning rate for the cosine annealing scheduler.  
+  *Example:* `"eta_min": 1e-6`
 
 - **first_cycle_fraction**:  
-  Fraction of the total steps used for the first learning rate cycle (scheduler setting).  
-  Use: `"first_cycle_fraction": 0.1`
+  Fraction of total steps used for the first cycle in the cosine annealing learning rate scheduler.  
+  *Example:* `"first_cycle_fraction": 0.1`
 
 - **t_mult**:  
   Multiplier to increase the cycle length after each restart in the learning rate scheduler.  
-  Use: `"t_mult": 2`
+  *Example:* `"t_mult": 2`
 
 - **rank**:  
   GaLore optimizer parameter defining the size of low-rank updates.  
-  Use: `"rank": 64`
+  *Example:* `"rank": 64`
 
 - **update_proj_gap**:  
-  How often (in steps) the GaLore projection is updated.  
-  Use: `"update_proj_gap": 200`
+  Frequency (in steps) at which the GaLore projection is updated.  
+  *Example:* `"update_proj_gap": 200`
 
 - **scale**:  
-  A factor used by GaLore to adjust the strength of updates.  
-  Use: `"scale": 0.25`
+  Scaling factor used by GaLore to adjust update strength.  
+  *Example:* `"scale": 0.25`
 
 - **proj_type**:  
-  Type of projection used in GaLore (often "std" for standard).  
-  Use: `"proj_type": "std"`
+  Type of projection used in GaLore (commonly `"std"` for standard).  
+  *Example:* `"proj_type": "std"`
 
 - **max_seq_length**:  
-  Maximum number of tokens per training example (longer sequences use more memory).  
-  Use: `"max_seq_length": 8192`
+  Maximum number of tokens per training example (longer sequences consume more memory).  
+  *Example:* `"max_seq_length": 2048`
 
 - **use_qlora**:  
-  If `true`, uses LoRA adapters (only a small set of parameters are trained).  
-  If `false`, performs full fine-tuning (updates all model weights).  
-  Use: `"use_qlora": true`
+  If set to `true`, uses LoRA adapters (only a subset of model parameters is trained).  
+  *Example:* `"use_qlora": true`
 
 - **load_in_4bit**:  
-  If `true`, loads the model with 4-bit quantization to save memory.  
-  Use: `"load_in_4bit": true`
-
-- **bnb_4bit_compute_dtype**:  
-  Data type for 4-bit mode computations, balancing speed and precision.  
-  Use: `"bnb_4bit_compute_dtype": "bfloat16"`
+  If `true`, loads the model in 4-bit quantization mode to reduce memory usage.  
+  *Example:* `"load_in_4bit": true`
 
 - **bnb_4bit_quant_type**:  
-  Quantization method for 4-bit mode (affects model precision).  
-  Use: `"bnb_4bit_quant_type": "nf4"`
+  Specifies the quantization method for 4-bit mode (affects precision and speed).  
+  *Example:* `"bnb_4bit_quant_type": "nf4"`
 
 - **bnb_4bit_use_double_quant**:  
-  If `true`, uses double quantization for improved precision in 4-bit mode.  
-  Use: `"bnb_4bit_use_double_quant": true`
+  If `true`, applies double quantization for improved precision in 4-bit mode.  
+  *Example:* `"bnb_4bit_use_double_quant": true`
 
 - **lora_r**:  
-  LoRA adapter rank; a lower number means fewer trainable parameters.  
-  Use: `"lora_r": 32`
+  Rank of the LoRA adapter (controls the number of trainable parameters for LoRA).  
+  *Example:* `"lora_r": 8`
 
 - **lora_alpha**:  
   Scaling factor for the LoRA adapter weights.  
-  Use: `"lora_alpha": 32`
+  *Example:* `"lora_alpha": 32`
 
 - **lora_dropout**:  
-  Dropout rate in LoRA layers to help prevent overfitting.  
-  Use: `"lora_dropout": 0.1`
+  Dropout rate used in LoRA layers to help prevent overfitting.  
+  *Example:* `"lora_dropout": 0.1`
 
 - **num_gpus**:  
-  Number of GPUs used during training for faster computation.  
-  Use: `"num_gpus": 2`
+  Number of GPUs to be used for training.  
+  *Example:* `"num_gpus": 2`
 
 - **prompt_template**:  
-  Template for formatting each training example (instruction, input, output).  
-  Use:  
+  Template used to format each training example (inserts instruction, input, and output into a predefined format).  
+  *Example:*  
   ```json
   "prompt_template": "<|im_start|>system\n\n{instruction}<|im_end|>\n<|im_start|>user\n\n{input}<|im_end|>\n<|im_start|>assistant\n\n{output}<|im_end|>"
   ```
