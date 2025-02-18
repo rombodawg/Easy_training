@@ -137,6 +137,10 @@ python QaloreTraining.py --config_file config.txt
   Number of GPUs to be used for training.  
   *Example:* `"num_gpus": 2`
 
+- **warmup_steps**:
+  Number of steps to gradually increase the learning rate at the start of training.
+  Use: `"warmup_steps": 200`
+  
 - **prompt_template**:  
   Template used to format each training example (inserts instruction, input, and output into a predefined format).  
   *Example:*  
