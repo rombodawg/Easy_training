@@ -29,6 +29,6 @@
   "lora_alpha": 32,
   "lora_dropout": 0.1,
   "num_gpus": 2,
-	"added_tokens": "<example>,</example2>",
+  "added_tokens": "<example>,</example2>",
   "prompt_template": "<|im_start|>system\n\n{instruction}<|im_end|>\n<|im_start|>user\n\n{input}<|im_end|>\n<|im_start|>assistant\n\n{output}<|im_end|>"
 }
