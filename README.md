@@ -27,6 +27,8 @@ edit the config file, and run this command to execute it
 accelerate launch QaloreTraining.py --config_file config.txt
 ```
 
+Note: the --resume_checkpoint flag exists in the code and is technicallly functional but is mostly broken and I dont recommend using it
+
 ### Explanation of Config Flags
 
 - **model_path**:  
