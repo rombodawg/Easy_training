@@ -22,7 +22,7 @@ from transformers import (
 )
 from galore_torch import GaLoreAdamW8bit
 from safetensors.torch import load_file
-from accelerate import infer_auto_device_map, dispatch_model
+from accelerate import infer_auto_device_map, dispatch_model, Accelerator
 
 
 def parse_config(config_file: str) -> dict:
@@ -36,49 +36,59 @@ def parse_config(config_file: str) -> dict:
 
 
 def save_training_state(checkpoint_dir: str, step: int, epoch: int,
-                        optimizer_state: dict, scheduler_state: dict) -> None:
+                          optimizer_state: dict, scheduler_state: dict, accelerator: Accelerator) -> None:
     """
     Save training progress, optimizer state, and scheduler state to a JSON file.
     """
-    serializable_optimizer_state = {}
-    for key, value in optimizer_state.items():
-        if key == 'state':
-            serializable_optimizer_state[key] = {}
-            for param_id, param_state in value.items():
-                serializable_optimizer_state[key][param_id] = {}
-                for state_key, state_value in param_state.items():
-                    # Skip GaLoreProjector references
-                    if (
-                        hasattr(state_value, '__class__') and
-                        state_value.__class__.__name__ == 'GaLoreProjector'
-                    ):
-                        continue
-                    if torch.is_tensor(state_value):
-                        serializable_optimizer_state[key][param_id][state_key] = state_value.cpu().tolist()
-                    else:
-                        serializable_optimizer_state[key][param_id][state_key] = state_value
-        else:
-            serializable_optimizer_state[key] = value
-
-    serializable_scheduler_state = {}
-    for key, value in scheduler_state.items():
-        if torch.is_tensor(value):
-            serializable_scheduler_state[key] = value.cpu().tolist()
-        else:
-            serializable_scheduler_state[key] = value
-
+    # Gather the training state from all processes
     state = {
-        'step': step,
-        'epoch': epoch,
-        'optimizer_state': serializable_optimizer_state,
-        'scheduler_state': serializable_scheduler_state
+        'step': accelerator.gather(torch.tensor(step)).cpu().tolist(),
+        'epoch': accelerator.gather(torch.tensor(epoch)).cpu().tolist(),
+        'optimizer_state': accelerator.gather(optimizer_state),  # Use passed optimizer_state
+        'scheduler_state': accelerator.gather(scheduler_state)   # Use passed scheduler_state
     }
 
-    with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w', encoding='utf-8') as f:
-        json.dump(state, f)
+    # Only save on the main process
+    if accelerator.is_main_process:
+        serializable_optimizer_state = {}
+        for key, value in state['optimizer_state'][0].items():  # Take state from the first gathered optimizer state
+            if key == 'state':
+                serializable_optimizer_state[key] = {}
+                for param_id, param_state in value.items():
+                    serializable_optimizer_state[key][param_id] = {}
+                    for state_key, state_value in param_state.items():
+                        # Skip GaLoreProjector references
+                        if (
+                            hasattr(state_value, '__class__') and
+                            state_value.__class__.__name__ == 'GaLoreProjector'
+                        ):
+                            continue
+                        if torch.is_tensor(state_value):
+                            serializable_optimizer_state[key][param_id][state_key] = state_value.cpu().tolist()
+                        else:
+                            serializable_optimizer_state[key][param_id][state_key] = state_value
+            else:
+                serializable_optimizer_state[key] = value
+
+        serializable_scheduler_state = {}
+        for key, value in state['scheduler_state'][0].items():  # Take state from the first gathered scheduler state
+            if torch.is_tensor(value):
+                serializable_scheduler_state[key] = value.cpu().tolist()
+            else:
+                serializable_scheduler_state[key] = value
+
+        final_state = {
+            'step': state['step'][0],  # Take step from the first gathered value
+            'epoch': state['epoch'][0],  # Take epoch from the first gathered value
+            'optimizer_state': serializable_optimizer_state,
+            'scheduler_state': serializable_scheduler_state
+        }
+
+        with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w', encoding='utf-8') as f:
+            json.dump(final_state, f)
 
 
-def load_training_state(checkpoint_dir: str, optimizer, scheduler) -> dict:
+def load_training_state(checkpoint_dir: str, optimizer, scheduler, accelerator: Accelerator) -> dict:
     """
     Load training progress, optimizer state, and scheduler state from a JSON file.
     Reconstructs the state for both optimizer and scheduler.
@@ -187,6 +197,37 @@ def preprocess_function(example: dict, tokenizer, max_seq_length: int,
     return tokenized
 
 
+def add_special_tokens(tokenizer, special_tokens_str: str):
+    """
+    Add special tokens to the tokenizer.
+
+    Args:
+        tokenizer: The tokenizer to modify
+        special_tokens_str: Comma-separated string of special tokens to add
+
+    Returns:
+        Modified tokenizer with special tokens added
+    """
+    if not special_tokens_str:
+        return tokenizer
+
+    # Parse special tokens from string
+    special_tokens = [token.strip() for token in special_tokens_str.split(',')]
+
+    # Add special tokens to tokenizer
+    special_tokens_dict = {'additional_special_tokens': special_tokens}
+    num_added = tokenizer.add_special_tokens(special_tokens_dict)
+
+    print(f"Added {num_added} special tokens to the tokenizer: {special_tokens}")
+
+    # Verify special tokens were added
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"Token '{token}' has ID: {token_id}")
+
+    return tokenizer
+
+
 def main() -> None:
     """
     Main training function.
@@ -200,6 +241,9 @@ def main() -> None:
                         help='Path to the checkpoint directory to resume training from.')
     args = parser.parse_args()
 
+    # Initialize accelerator
+    accelerator = Accelerator()
+
     # Load config and create directories
     config = parse_config(args.config_file)
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
@@ -209,15 +253,16 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(config["model_path"])
     tokenizer.pad_token = tokenizer.eos_token
 
+    # Add special tokens if specified in config
+    if "added_tokens" in config and config["added_tokens"]:
+        tokenizer = add_special_tokens(tokenizer, config["added_tokens"])
+
     num_gpus = config.get("num_gpus", 1)
     if num_gpus > 8:
         num_gpus = 8
 
     if torch.cuda.is_available():
-        if num_gpus > 1 and config.get("load_in_4bit", False):
-            device_map = "auto"
-        else:
-            device_map = {"": 0}
+        device_map = {"": accelerator.local_process_index}  # Use accelerator's local process index
     else:
         device_map = "cpu"
 
@@ -248,6 +293,11 @@ def main() -> None:
         config
     )
 
+    # Resize token embeddings to account for any new special tokens
+    if "added_tokens" in config and config["added_tokens"]:
+        print(f"Resizing token embeddings from {model.get_input_embeddings().weight.shape[0]} to {len(tokenizer)}")
+        model.resize_token_embeddings(len(tokenizer))
+
     # If using QLoRA, prepare for kbit training and enable LoRA
     if config.get("use_qlora", False):
         from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
@@ -264,9 +314,6 @@ def main() -> None:
         )
         model = get_peft_model(model, lora_config)
 
-    if num_gpus > 1 and device_map != "auto":
-        model = torch.nn.DataParallel(model, device_ids=list(range(num_gpus)))
-
     prompt_template = config.get("prompt_template", None)
 
     # Prepare dataset
@@ -281,8 +328,13 @@ def main() -> None:
     )
 
     dataset_hash = hashlib.md5(config["dataset_path"].encode()).hexdigest()
+    # Add special tokens to the cache file name to ensure proper regeneration when tokens change
+    special_tokens_hash = ""
+    if "added_tokens" in config and config["added_tokens"]:
+        special_tokens_hash = hashlib.md5(config["added_tokens"].encode()).hexdigest()[:8]
+
     cache_file_name = os.path.join(
-        config["cache_dir"], f"processed_dataset_{dataset_hash}.arrow"
+        config["cache_dir"], f"processed_dataset_{dataset_hash}_{special_tokens_hash}.arrow"
     )
 
     tokenized_dataset = dataset.map(
@@ -343,7 +395,7 @@ def main() -> None:
 
     total_training_steps = len(train_dataloader)
     first_cycle_steps = int(total_training_steps * config["first_cycle_fraction"])
-    
+
     # Learning rate warmup (if specified in config)
     warmup_steps = config.get("warmup_steps", 0)
     if warmup_steps > 0:
@@ -368,11 +420,16 @@ def main() -> None:
     start_step = 0
     start_epoch = 0
     if args.resume_checkpoint is not None:
-        state = load_training_state(args.resume_checkpoint, optimizer, scheduler)
+        state = load_training_state(args.resume_checkpoint, optimizer, scheduler, accelerator)
         if state is not None:
             start_step = state['step']
             start_epoch = state['epoch']
             print(f"Resuming training from epoch {start_epoch}, step {start_step}")
+
+    # Prepare model, optimizer, dataloader, and scheduler for distributed training
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, scheduler
+    )
 
     model.train()
     total_steps = len(train_dataloader)
@@ -384,16 +441,14 @@ def main() -> None:
     for epoch in range(start_epoch, config["num_epochs"]):
         running_loss = 0.0
         optimizer.zero_grad()
-        progress_bar = tqdm(enumerate(train_dataloader), total=total_steps, initial=start_step)
+        progress_bar = tqdm(enumerate(train_dataloader), total=total_steps, initial=start_step, disable=not accelerator.is_main_process)  # Disable tqdm on non-main processes
 
         for step, batch in progress_bar:
             if step < start_step:
                 continue
 
-            primary_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             inputs = {
-                k: v.view(-1, v.size(-1)).to(primary_device, non_blocking=True)
-                if isinstance(v, torch.Tensor) else v
+                k: v.view(-1, v.size(-1)) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             if 'attention_mask' not in inputs:
@@ -428,54 +483,64 @@ def main() -> None:
 
                 # Compute epoch progress as: current epoch index + (current step/total steps)
                 epoch_progress = epoch + (step / total_steps)
-                progress_bar.set_postfix({
-                    'epoch': f'{epoch_progress:.2f}',
-                    'loss': f'{current_loss:.5f}',
-                    'avg_loss': f'{avg_loss:.5f}',
-                    'lr': f'{current_lr:.2e}',
-                    'step': f'{step}/{total_steps}'
-                })
+                if accelerator.is_main_process:  # Only print progress bar on main process
+                    progress_bar.set_postfix({
+                        'epoch': f'{epoch_progress:.2f}',
+                        'loss': f'{current_loss:.5f}',
+                        'avg_loss': f'{avg_loss:.5f}',
+                        'lr': f'{current_lr:.2e}',
+                        'step': f'{step}/{total_steps}'
+                    })
                 running_loss = 0.0
 
             if step > 0 and step % config["save_interval"] == 0:
                 checkpoint_path = os.path.join(
                     config['checkpoint_dir'], f"checkpoint-{step}"
                 )
-                model_to_save = model.module if hasattr(model, "module") else model
-                model_to_save.save_pretrained(checkpoint_path)
+                # Save model, tokenizer and training state using accelerator.save and accelerator.wait_for_everyone
+                accelerator.wait_for_everyone()  # Ensure all processes are at the same point before saving
+                if accelerator.is_main_process:  # Only save on main process
+                    model_to_save = accelerator.unwrap_model(model)  # Unwrap the distributed model
+                    model_to_save.save_pretrained(checkpoint_path)
+                    tokenizer.save_pretrained(checkpoint_path)
+                    save_training_state(
+                        checkpoint_path,
+                        step,
+                        epoch,
+                        optimizer.state_dict(),
+                        scheduler.state_dict(),
+                        accelerator
+                    )
 
-                save_training_state(
-                    checkpoint_path,
-                    step,
-                    epoch,
-                    optimizer.state_dict(),
-                    scheduler.state_dict()
-                )
-
-                # Remove older checkpoints if necessary
-                checkpoints = sorted([
-                    d for d in os.listdir(config["checkpoint_dir"])
-                    if d.startswith('checkpoint-')
-                ])
-                while len(checkpoints) > config["keep_last_checkpoints"]:
-                    oldest_checkpoint = checkpoints.pop(0)
-                    shutil.rmtree(os.path.join(config["checkpoint_dir"], oldest_checkpoint))
+                    # Remove older checkpoints if necessary
+                    checkpoints = sorted([
+                        d for d in os.listdir(config["checkpoint_dir"])
+                        if d.startswith('checkpoint-')
+                    ])
+                    while len(checkpoints) > config["keep_last_checkpoints"]:
+                        oldest_checkpoint = checkpoints.pop(0)
+                        shutil.rmtree(os.path.join(config["checkpoint_dir"], oldest_checkpoint))
+                accelerator.wait_for_everyone()  # Wait for main process to finish saving
 
             if step % 100 == 0:
                 clear_gpu_memory()
 
         progress_bar.close()
 
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(config["final_output_path"])
-    tokenizer.save_pretrained(config["final_output_path"])
-    save_training_state(
-        config["final_output_path"],
-        total_training_steps,
-        epoch,
-        optimizer.state_dict(),
-        scheduler.state_dict()
-    )
+    accelerator.wait_for_everyone()  # Ensure all processes are finished before final save
+    if accelerator.is_main_process:  # Only save on main process
+        model_to_save = accelerator.unwrap_model(model)
+        model_to_save.save_pretrained(config["final_output_path"])
+        tokenizer.save_pretrained(config["final_output_path"])
+        save_training_state(
+            config["final_output_path"],
+            total_training_steps,
+            epoch,
+            optimizer.state_dict(),
+            scheduler.state_dict(),
+            accelerator
+        )
+    accelerator.end_training()  # Finalize accelerator processes
 
 
 if __name__ == "__main__":
