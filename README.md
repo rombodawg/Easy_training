@@ -149,10 +149,6 @@ accelerate launch QaloreTraining.py --config_file config.txt
   Number of steps to gradually increase the learning rate at the start of training.
   Use: `"warmup_steps": 200`
 
-- **added_tokens**:
-  Custom tokens to add to the tokenizer's vocabulary.
-  Use: `"added_tokens": "<example>,</example2>"`
-  
 - **prompt_template**:  
   Template used to format each training example (inserts instruction, input, and output into a predefined format).  
   *Example:*  
