@@ -24,14 +24,14 @@ pip install -r requirements.txt
 ```
 edit the config file, and run this command to execute it
 ```
-python QaloreTraining.py --config_file config.txt
+accelerate launch QaloreTraining.py --config_file config.txt
 ```
 
 Optional:
 
 Use the --resume_checkpoint to resume from a previously saved checkpoint
 ```
-python QaloreTraining.py --config_file config.txt --resume_checkpoint folder_location
+accelerate launch QaloreTraining.py --config_file config.txt --resume_checkpoint folder_location
 ```
 
 ### Explanation of Config Flags
